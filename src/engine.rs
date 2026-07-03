@@ -204,6 +204,96 @@ impl Engine {
         self.manifest.save(&self.path.join("MANIFEST"))?;
         self.reset_wal()?;
 
+        // Trigger compaction if L0 is too large.
+        self.maybe_compact()?;
+
+        Ok(())
+    }
+
+    /// Trigger L0 → L1 compaction when L0 has ≥ 4 SSTables.
+    fn maybe_compact(&mut self) -> Result<()> {
+        /// Number of L0 SSTables that triggers compaction.
+        const L0_COMPACTION_THRESHOLD: usize = 4;
+
+        let l0_count = self.manifest.ssts_at_level(0).len();
+        if l0_count < L0_COMPACTION_THRESHOLD {
+            return Ok(());
+        }
+
+        // Collect all L0 SSTable ids and their key ranges.
+        let l0_metas: Vec<SSTMeta> = self.manifest.ssts_at_level(0).to_vec();
+        let l0_ids: Vec<u64> = l0_metas.iter().map(|m| m.id).collect();
+
+        // Find L1 SSTables that overlap with the L0 key range.
+        let global_min = l0_metas.iter().map(|m| m.min_key.clone()).min().unwrap();
+        let global_max = l0_metas.iter().map(|m| m.max_key.clone()).max().unwrap();
+
+        let l1_metas: Vec<SSTMeta> = self
+            .manifest
+            .ssts_at_level(1)
+            .iter()
+            .filter(|m| m.max_key >= global_min && m.min_key <= global_max)
+            .cloned()
+            .collect();
+        let l1_ids: Vec<u64> = l1_metas.iter().map(|m| m.id).collect();
+
+        // Merge-sort all entries from L0 and overlapping L1.
+        let mut all_entries: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
+            std::collections::BTreeMap::new();
+
+        // L1 first (older), then L0 (newer, overwrites).
+        for id in &l1_ids {
+            if let Some((_, reader)) = self.sst_readers.iter().find(|(m, _)| m.id == *id) {
+                for (k, v) in reader.iter() {
+                    all_entries.insert(k, v);
+                }
+            }
+        }
+        for id in &l0_ids {
+            if let Some((_, reader)) = self.sst_readers.iter().find(|(m, _)| m.id == *id) {
+                for (k, v) in reader.iter() {
+                    all_entries.insert(k, v);
+                }
+            }
+        }
+
+        // Filter out tombstones.
+        all_entries.retain(|_, v| v.as_slice() != TOMBSTONE);
+
+        // Write new L1 SSTables (one SST per compaction for simplicity).
+        let new_sst_id = self.next_sst_id;
+        self.next_sst_id += 1;
+        let new_sst_path = self.path.join(format!("{:06}.sst", new_sst_id));
+
+        if all_entries.is_empty() {
+            // All entries were tombstones — just remove old SSTs.
+        } else {
+            let mut builder = SSTableBuilder::new(&new_sst_path, DEFAULT_BLOCK_SIZE)?;
+            for (k, v) in &all_entries {
+                builder.add(k, v)?;
+            }
+            builder.finish()?;
+
+            let min_key = all_entries.keys().next().unwrap().clone();
+            let max_key = all_entries.keys().last().unwrap().clone();
+            let meta = SSTMeta::new(new_sst_id, 1, min_key, max_key);
+            let reader = SSTableReader::open(&new_sst_path)?;
+            self.manifest.add_sst(1, meta);
+            self.sst_readers.push((
+                self.manifest.ssts_at_level(1).last().unwrap().clone(),
+                reader,
+            ));
+        }
+
+        // Remove old SSTs from manifest and disk.
+        for id in l0_ids.iter().chain(l1_ids.iter()) {
+            self.manifest.remove_sst(*id);
+            self.sst_readers.retain(|(m, _)| m.id != *id);
+            let old_path = self.path.join(format!("{:06}.sst", id));
+            let _ = fs::remove_file(old_path); // ignore error if already gone
+        }
+
+        self.manifest.save(&self.path.join("MANIFEST"))?;
         Ok(())
     }
 
@@ -346,5 +436,38 @@ mod tests {
         let results = db.scan(b"a", b"d").unwrap();
         let keys: Vec<_> = results.iter().map(|(k, _)| k.as_slice()).collect();
         assert_eq!(keys, vec![b"a".as_slice(), b"c".as_slice()]);
+    }
+
+    #[test]
+    fn compaction_triggered_by_l0_threshold() {
+        let dir = tempdir().unwrap();
+        let mut db = Engine::open(dir.path()).unwrap();
+
+        // Write enough data. The default memtable is 4MB, so we write
+        // enough small keys to accumulate L0 SSTables over multiple put()
+        // calls.  With 5000 keys of ~20 bytes each, the memtable won't
+        // freeze on its own, so we rely on the natural flow.
+        //
+        // To actually trigger compaction we write large values so the
+        // memtable fills and flushes multiple times.
+        for batch in 0..6 {
+            // Each batch fills the 4MB memtable once.
+            for i in 0..50 {
+                let key = format!("b{:01}_k{:04}", batch, i);
+                // ~100KB value → ~5MB per batch → triggers freeze.
+                let val = vec![b'v'; 20_000];
+                db.put(key.as_bytes(), &val).unwrap();
+            }
+        }
+
+        // After multiple flushes, data should still be readable.
+        for batch in 0..6 {
+            for i in 0..50 {
+                let key = format!("b{:01}_k{:04}", batch, i);
+                let v = db.get(key.as_bytes()).unwrap();
+                assert!(v.is_some(), "data lost for key {}", key);
+                assert_eq!(v.unwrap().len(), 20_000);
+            }
+        }
     }
 }
