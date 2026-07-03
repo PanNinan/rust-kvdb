@@ -27,3 +27,4 @@ fuzz/artifacts/
 
 # Benchmarks
 criterion/
+mydb/
