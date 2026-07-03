@@ -1,1 +1,29 @@
-/target
+# Build artifacts
+/target/
+
+# Cargo
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Coverage
+*.profraw
+*.profdata
+*.lcov
+coverage/
+
+# Fuzz
+fuzz/target/
+fuzz/artifacts/
+
+# Benchmarks
+criterion/
