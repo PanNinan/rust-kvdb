@@ -6,7 +6,9 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
+use crate::cache::block_cache::{BlockCache, CacheKey};
 use crate::error::{KvError, Result};
 use crate::filter::bloom::BloomFilter;
 use crate::sstable::block::Block;
@@ -17,13 +19,25 @@ pub struct SSTableReader {
     index: Vec<(u32, Vec<u8>)>,
     index_offset: u32,
     bloom: BloomFilter,
+    /// This SSTable's unique id (used as cache key).
+    sst_id: u64,
+    /// Shared block cache (optional).
+    cache: Option<Arc<Mutex<BlockCache>>>,
 }
 
 impl SSTableReader {
     /// Open an SSTable file and parse its footer, index block, and bloom filter.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_cache(path, 0, None)
+    }
+
+    /// Open with an SST id and optional shared block cache.
+    pub fn open_with_cache(
+        path: &Path,
+        sst_id: u64,
+        cache: Option<Arc<Mutex<BlockCache>>>,
+    ) -> Result<Self> {
         let data = fs::read(path).map_err(KvError::Io)?;
-        // Footer is now 8 bytes: index_offset(4) + bloom_offset(4).
         if data.len() < 8 {
             return Err(KvError::Corruption("SSTable file too short".to_string()));
         }
@@ -54,12 +68,13 @@ impl SSTableReader {
             index,
             index_offset,
             bloom,
+            sst_id,
+            cache,
         })
     }
 
     /// Look up a key.  Returns `Ok(Some(value))` if found, `Ok(None)` if not.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Bloom filter check: skip index search if key is definitely absent.
         if !self.bloom.may_contain(key) {
             return Ok(None);
         }
@@ -148,6 +163,17 @@ impl SSTableReader {
     }
 
     fn load_block(&self, block_idx: usize) -> Result<Block> {
+        // Check cache first.
+        if let Some(ref cache) = self.cache {
+            let key = CacheKey {
+                sst_id: self.sst_id,
+                block_idx,
+            };
+            if let Some(block) = cache.lock().unwrap().get(&key) {
+                return Ok(block.clone());
+            }
+        }
+
         let start = self.index[block_idx].0 as usize;
         let end = if block_idx + 1 < self.index.len() {
             self.index[block_idx + 1].0 as usize
@@ -162,7 +188,18 @@ impl SSTableReader {
             )));
         }
 
-        Block::decode(&self.data[start..end])
+        let block = Block::decode(&self.data[start..end])?;
+
+        // Populate cache.
+        if let Some(ref cache) = self.cache {
+            let key = CacheKey {
+                sst_id: self.sst_id,
+                block_idx,
+            };
+            cache.lock().unwrap().put(key, block.clone());
+        }
+
+        Ok(block)
     }
 }
 

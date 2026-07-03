@@ -4,6 +4,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+
+use tracing::{debug, info};
 
 use crate::error::Result;
 use crate::manifest::{Manifest, SSTMeta};
@@ -27,6 +30,12 @@ pub struct Options {
     pub l0_compaction_threshold: usize,
     /// Whether to fsync after every write. Default: true.
     pub sync_wal: bool,
+    /// Maximum number of LSM levels. Default: 7.
+    pub max_levels: usize,
+    /// Bloom filter bits per key. Default: 10.
+    pub bloom_filter_bits_per_key: usize,
+    /// Block cache capacity in bytes. Default: 8 MiB. 0 = disabled.
+    pub block_cache_size: usize,
 }
 
 impl Default for Options {
@@ -36,6 +45,9 @@ impl Default for Options {
             block_size: 4096,
             l0_compaction_threshold: 4,
             sync_wal: true,
+            max_levels: 7,
+            bloom_filter_bits_per_key: 10,
+            block_cache_size: 8 * 1024 * 1024,
         }
     }
 }
@@ -90,12 +102,13 @@ pub struct Engine {
     opts: Options,
     /// Metrics counters.
     pub metrics: Metrics,
+    /// Shared block cache.
+    block_cache: Option<Arc<StdMutex<crate::cache::block_cache::BlockCache>>>,
 }
 
 /// A point-in-time snapshot of the database.
 #[derive(Debug, Clone, Copy)]
 pub struct Snapshot {
-    #[allow(dead_code)] // Used in Phase 4 for per-value sequence filtering
     seq: u64,
 }
 
@@ -114,10 +127,20 @@ impl Engine {
 
     /// Open (or create) a database with custom options.
     pub fn open_with_options(path: &Path, opts: Options) -> Result<Self> {
+        info!(path = %path.display(), "opening database");
         fs::create_dir_all(path)?;
 
         let manifest_path = path.join("MANIFEST");
         let manifest = Manifest::load(&manifest_path)?;
+
+        // Create block cache if enabled.
+        let block_cache = if opts.block_cache_size > 0 {
+            Some(Arc::new(StdMutex::new(
+                crate::cache::block_cache::BlockCache::new(opts.block_cache_size),
+            )))
+        } else {
+            None
+        };
 
         // Open SSTable readers and determine next id.
         let mut next_sst_id: u64 = 1;
@@ -127,7 +150,11 @@ impl Engine {
             for meta in level {
                 let sst_path = path.join(format!("{:06}.sst", meta.id));
                 if sst_path.exists() {
-                    let reader = SSTableReader::open(&sst_path)?;
+                    let reader = SSTableReader::open_with_cache(
+                        &sst_path,
+                        meta.id,
+                        block_cache.clone(),
+                    )?;
                     if meta.id >= next_sst_id {
                         next_sst_id = meta.id + 1;
                     }
@@ -155,16 +182,21 @@ impl Engine {
             next_seq: 1,
             opts,
             metrics: Metrics::new(),
+            block_cache,
         })
     }
 
     /// Write a key-value pair.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.wal.append(key, value)?;
+        let seq = self.next_seq;
+        self.next_seq += 1;
+
+        let encoded = Self::encode_with_seq(value, seq);
+        self.wal.append(key, &encoded)?;
         if self.opts.sync_wal {
             self.wal.flush()?;
         }
-        self.memtable.put(key, value);
+        self.memtable.put(key, &encoded);
         self.metrics.writes.fetch_add(1, Ordering::Relaxed);
         self.maybe_flush()?;
         Ok(())
@@ -173,16 +205,21 @@ impl Engine {
     /// Delete a key by writing a tombstone.
     pub fn delete(&mut self, key: &[u8]) -> Result<()> {
         use crate::wal::record::{OpType, Record};
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
+
+        let encoded = Self::encode_with_seq(TOMBSTONE, seq);
         let record = Record {
             op: OpType::Delete,
             key: key.to_vec(),
-            value: Vec::new(),
+            value: encoded.clone(),
         };
         self.wal.append_record(&record)?;
         if self.opts.sync_wal {
             self.wal.flush()?;
         }
-        self.memtable.put(key, TOMBSTONE);
+        self.memtable.put(key, &encoded);
         self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
         self.maybe_flush()?;
         Ok(())
@@ -238,14 +275,29 @@ impl Engine {
 
     /// Look up a key at a specific snapshot.
     ///
-    /// Only returns values written before or at the snapshot's sequence number.
-    /// For Phase 3, this is a simplified implementation that returns the
-    /// current value if it existed at snapshot time.
-    pub fn get_at(&self, key: &[u8], _snap: &Snapshot) -> Result<Option<Vec<u8>>> {
-        // Simplified: in Phase 3 we don't track per-value sequence numbers
-        // in the SSTable layer.  This returns the current value, which is
-        // correct for the common case (no overwrite between snapshot and read).
-        self.get(key)
+    /// Only returns values with `seq < snap.seq` (written before the snapshot).
+    pub fn get_at(&self, key: &[u8], snap: &Snapshot) -> Result<Option<Vec<u8>>> {
+        // Check MemTable.
+        if let Some(v) = self.memtable.get(key) {
+            if let Some((val, seq)) = Self::decode_with_seq(&v) {
+                if seq < snap.seq {
+                    return Ok(Self::unpack_inner(&val));
+                }
+            }
+        }
+
+        // Check SSTables (newest first).
+        for (_meta, reader) in self.sst_readers.iter().rev() {
+            if let Some(v) = reader.get(key)? {
+                if let Some((val, seq)) = Self::decode_with_seq(&v) {
+                    if seq < snap.seq {
+                        return Ok(Self::unpack_inner(&val));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Write a key-value pair with a TTL (time-to-live).
@@ -270,23 +322,23 @@ impl Engine {
         encoded.extend_from_slice(&expiry.to_le_bytes());
         encoded.extend_from_slice(value);
 
-        self.put(key, &encoded)
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let seq_encoded = Self::encode_with_seq(&encoded, seq);
+        self.wal.append(key, &seq_encoded)?;
+        if self.opts.sync_wal {
+            self.wal.flush()?;
+        }
+        self.memtable.put(key, &seq_encoded);
+        self.metrics.writes.fetch_add(1, Ordering::Relaxed);
+        self.maybe_flush()?;
+        Ok(())
     }
 
     /// Scan keys with a given prefix.
     pub fn prefix_scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let end = next_key(prefix);
-        let mut results = self.scan(prefix, &end)?;
-        // Unwrap TTL-encoded values.
-        for (_, v) in &mut results {
-            if let Some(inner) = Self::unwrap_ttl(v) {
-                *v = inner;
-            } else {
-                *v = Vec::new(); // expired
-            }
-        }
-        results.retain(|(_, v)| !v.is_empty());
-        Ok(results)
+        self.scan(prefix, &end)
     }
 
     /// Repair a corrupted database directory.
@@ -394,10 +446,26 @@ impl Engine {
             map.insert(k, v);
         }
 
-        // Filter out tombstones.
+        // Filter out tombstones and expired TTL keys.
         let result: Vec<_> = map
             .into_iter()
-            .filter(|(_, v)| v.as_slice() != TOMBSTONE)
+            .filter(|(_, v)| {
+                if let Some((inner, _seq)) = Self::decode_with_seq(v) {
+                    if inner.as_slice() == TOMBSTONE {
+                        return false;
+                    }
+                    Self::unwrap_ttl(&inner).is_some()
+                } else {
+                    true
+                }
+            })
+            .map(|(k, v)| {
+                // Strip seq prefix from value.
+                let display_v = Self::decode_with_seq(&v)
+                    .and_then(|(inner, _)| Self::unpack_inner(&inner))
+                    .unwrap_or_default();
+                (k, display_v)
+            })
             .collect();
 
         Ok(result)
@@ -440,6 +508,7 @@ impl Engine {
         if !self.memtable.has_immutable() {
             return Ok(());
         }
+        debug!("flushing immutable memtable to SSTable");
 
         let immutable = self
             .memtable
@@ -465,7 +534,7 @@ impl Engine {
         let max_key = entries.last().unwrap().0.clone();
         let meta = SSTMeta::new(sst_id, 0, min_key, max_key);
 
-        let reader = SSTableReader::open(&sst_path)?;
+        let reader = SSTableReader::open_with_cache(&sst_path, sst_id, self.block_cache.clone())?;
         self.manifest.add_sst(0, meta.clone());
         self.sst_readers.push((meta, reader));
 
@@ -479,44 +548,56 @@ impl Engine {
         Ok(())
     }
 
-    /// Trigger L0 → L1 compaction when L0 has ≥ 4 SSTables.
+    /// Trigger compaction when any level exceeds its capacity.
+    ///
+    /// L0 threshold = `l0_compaction_threshold` (default 4).
+    /// L1+ threshold = 10 × previous level's threshold.
     fn maybe_compact(&mut self) -> Result<()> {
-        // Number of L0 SSTables that triggers compaction.
-        let l0_count = self.manifest.ssts_at_level(0).len();
-        if l0_count < self.opts.l0_compaction_threshold {
-            return Ok(());
+        // Check each level from L0 upward.
+        for level in 0..self.opts.max_levels.saturating_sub(1) {
+            let threshold = if level == 0 {
+                self.opts.l0_compaction_threshold
+            } else {
+                // Each level is 10× the previous.
+                self.opts.l0_compaction_threshold * 10_usize.pow(level as u32)
+            };
+
+            if self.manifest.ssts_at_level(level).len() < threshold {
+                continue;
+            }
+
+            self.compact_level(level)?;
         }
+        Ok(())
+    }
 
-        // Collect all L0 SSTable ids and their key ranges.
-        let l0_metas: Vec<SSTMeta> = self.manifest.ssts_at_level(0).to_vec();
-        let l0_ids: Vec<u64> = l0_metas.iter().map(|m| m.id).collect();
+    /// Compact SSTables from `src_level` into `dst_level = src_level + 1`.
+    fn compact_level(&mut self, src_level: usize) -> Result<()> {
+        let dst_level = src_level + 1;
+        info!(src_level, dst_level, "starting compaction");
 
-        // Find L1 SSTables that overlap with the L0 key range.
-        let global_min = l0_metas.iter().map(|m| m.min_key.clone()).min().unwrap();
-        let global_max = l0_metas.iter().map(|m| m.max_key.clone()).max().unwrap();
+        // Collect source level SSTables.
+        let src_metas: Vec<SSTMeta> = self.manifest.ssts_at_level(src_level).to_vec();
+        let src_ids: Vec<u64> = src_metas.iter().map(|m| m.id).collect();
 
-        let l1_metas: Vec<SSTMeta> = self
+        // Find overlapping destination level SSTables.
+        let global_min = src_metas.iter().map(|m| m.min_key.clone()).min().unwrap();
+        let global_max = src_metas.iter().map(|m| m.max_key.clone()).max().unwrap();
+
+        let dst_metas: Vec<SSTMeta> = self
             .manifest
-            .ssts_at_level(1)
+            .ssts_at_level(dst_level)
             .iter()
             .filter(|m| m.max_key >= global_min && m.min_key <= global_max)
             .cloned()
             .collect();
-        let l1_ids: Vec<u64> = l1_metas.iter().map(|m| m.id).collect();
+        let dst_ids: Vec<u64> = dst_metas.iter().map(|m| m.id).collect();
 
-        // Merge-sort all entries from L0 and overlapping L1.
+        // Merge-sort all entries (destination first = older, then source = newer).
         let mut all_entries: std::collections::BTreeMap<Vec<u8>, Vec<u8>> =
             std::collections::BTreeMap::new();
 
-        // L1 first (older), then L0 (newer, overwrites).
-        for id in &l1_ids {
-            if let Some((_, reader)) = self.sst_readers.iter().find(|(m, _)| m.id == *id) {
-                for (k, v) in reader.iter() {
-                    all_entries.insert(k, v);
-                }
-            }
-        }
-        for id in &l0_ids {
+        for id in dst_ids.iter().chain(src_ids.iter()) {
             if let Some((_, reader)) = self.sst_readers.iter().find(|(m, _)| m.id == *id) {
                 for (k, v) in reader.iter() {
                     all_entries.insert(k, v);
@@ -524,17 +605,24 @@ impl Engine {
             }
         }
 
-        // Filter out tombstones.
-        all_entries.retain(|_, v| v.as_slice() != TOMBSTONE);
+        // Filter out tombstones and expired TTL keys.
+        all_entries.retain(|_, v| {
+            if let Some((inner, _seq)) = Self::decode_with_seq(v) {
+                if inner.as_slice() == TOMBSTONE {
+                    return false;
+                }
+                Self::unwrap_ttl(&inner).is_some()
+            } else {
+                false
+            }
+        });
 
-        // Write new L1 SSTables (one SST per compaction for simplicity).
-        let new_sst_id = self.next_sst_id;
-        self.next_sst_id += 1;
-        let new_sst_path = self.path.join(format!("{:06}.sst", new_sst_id));
+        // Write new SSTables to the destination level.
+        if !all_entries.is_empty() {
+            let new_sst_id = self.next_sst_id;
+            self.next_sst_id += 1;
+            let new_sst_path = self.path.join(format!("{:06}.sst", new_sst_id));
 
-        if all_entries.is_empty() {
-            // All entries were tombstones — just remove old SSTs.
-        } else {
             let mut builder = SSTableBuilder::new(&new_sst_path, self.opts.block_size)?;
             for (k, v) in &all_entries {
                 builder.add(k, v)?;
@@ -543,21 +631,25 @@ impl Engine {
 
             let min_key = all_entries.keys().next().unwrap().clone();
             let max_key = all_entries.keys().last().unwrap().clone();
-            let meta = SSTMeta::new(new_sst_id, 1, min_key, max_key);
-            let reader = SSTableReader::open(&new_sst_path)?;
-            self.manifest.add_sst(1, meta);
+            let meta = SSTMeta::new(new_sst_id, dst_level, min_key, max_key);
+            let reader = SSTableReader::open_with_cache(
+                &new_sst_path,
+                new_sst_id,
+                self.block_cache.clone(),
+            )?;
+            self.manifest.add_sst(dst_level, meta);
             self.sst_readers.push((
-                self.manifest.ssts_at_level(1).last().unwrap().clone(),
+                self.manifest.ssts_at_level(dst_level).last().unwrap().clone(),
                 reader,
             ));
         }
 
         // Remove old SSTs from manifest and disk.
-        for id in l0_ids.iter().chain(l1_ids.iter()) {
+        for id in src_ids.iter().chain(dst_ids.iter()) {
             self.manifest.remove_sst(*id);
             self.sst_readers.retain(|(m, _)| m.id != *id);
             let old_path = self.path.join(format!("{:06}.sst", id));
-            let _ = fs::remove_file(old_path); // ignore error if already gone
+            let _ = fs::remove_file(old_path);
         }
 
         self.manifest.save(&self.path.join("MANIFEST"))?;
@@ -577,13 +669,39 @@ impl Engine {
         Ok(())
     }
 
-    /// Map a stored value to the user-visible result.
-    /// Checks tombstones and TTL expiry.
-    fn unpack_value(v: &[u8]) -> Option<Vec<u8>> {
+    /// Encode a value with a sequence number prefix.
+    fn encode_with_seq(value: &[u8], seq: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + value.len());
+        buf.extend_from_slice(&seq.to_le_bytes());
+        buf.extend_from_slice(value);
+        buf
+    }
+
+    /// Decode a seq-encoded value.
+    fn decode_with_seq(v: &[u8]) -> Option<(Vec<u8>, u64)> {
+        if v.len() >= 8 {
+            let seq = u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]);
+            Some((v[8..].to_vec(), seq))
+        } else {
+            Some((v.to_vec(), 0))
+        }
+    }
+
+    /// Unpack inner value (after seq stripping): check tombstone and TTL.
+    fn unpack_inner(v: &[u8]) -> Option<Vec<u8>> {
         if v == TOMBSTONE {
             return None;
         }
         Self::unwrap_ttl(v)
+    }
+
+    /// Map a stored value (with seq prefix) to the user-visible result.
+    fn unpack_value(v: &[u8]) -> Option<Vec<u8>> {
+        if let Some((inner, _seq)) = Self::decode_with_seq(v) {
+            Self::unpack_inner(&inner)
+        } else {
+            None
+        }
     }
 
     /// Unwrap a TTL-encoded value.  Returns `None` if expired.
@@ -810,15 +928,20 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut db = Engine::open(dir.path()).unwrap();
 
-        db.put(b"key", b"v1").unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
         let snap = db.snapshot();
 
-        db.put(b"key", b"v2").unwrap();
+        // New write after snapshot.
+        db.put(b"c", b"3").unwrap();
 
-        // Current get sees v2.
-        assert_eq!(db.get(b"key").unwrap(), Some(b"v2".to_vec()));
-        // Snapshot also returns current (simplified Phase 3 impl).
-        assert_eq!(db.get_at(b"key", &snap).unwrap(), Some(b"v2".to_vec()));
+        // Snapshot sees a and b (written before), but not c.
+        assert_eq!(db.get_at(b"a", &snap).unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get_at(b"b", &snap).unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get_at(b"c", &snap).unwrap(), None);
+
+        // Current get sees all three.
+        assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()));
     }
 
     #[test]
@@ -894,7 +1017,7 @@ mod tests {
 // DB — Thread-safe wrapper around Engine
 // ---------------------------------------------------------------------------
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// A thread-safe handle to the key-value database.
 ///
@@ -997,7 +1120,6 @@ impl DB {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use std::sync::Arc;
     use std::thread;
     use tempfile::tempdir;
 

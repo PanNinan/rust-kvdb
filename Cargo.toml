@@ -15,6 +15,7 @@ harness = false
 [dependencies]
 # Phase 1
 crc32fast = "1"          # WAL CRC checksum
+tracing = "0.1"          # Structured logging
 
 [dev-dependencies]
 tempfile = "3"

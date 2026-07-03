@@ -51,29 +51,37 @@ impl Block {
         &self.entries.last().expect("block is empty").0
     }
 
-    /// Serialize the block to its on-disk format.
+    /// Serialize the block with prefix compression.
     ///
     /// ```text
     /// [num_entries: u32 LE]
     /// for each entry:
-    ///     [key_len: u32 LE] [key: [u8]]
+    ///     [shared_len: u16 LE] [suffix_len: u16 LE] [suffix: [u8]]
     ///     [value_len: u32 LE] [value: [u8]]
     /// ```
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(4 + self.encoded_size);
         buf.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
 
+        let mut prev_key: &[u8] = &[];
         for (key, value) in &self.entries {
-            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
-            buf.extend_from_slice(key);
+            // Compute shared prefix length with previous key.
+            let shared = Self::prefix_shared_len(prev_key, key);
+            let suffix = &key[shared..];
+
+            buf.extend_from_slice(&(shared as u16).to_le_bytes());
+            buf.extend_from_slice(&(suffix.len() as u16).to_le_bytes());
+            buf.extend_from_slice(suffix);
             buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
             buf.extend_from_slice(value);
+
+            prev_key = key;
         }
 
         buf
     }
 
-    /// Deserialize a block from its on-disk bytes.
+    /// Deserialize a prefix-compressed block from its on-disk bytes.
     pub fn decode(buf: &[u8]) -> crate::error::Result<Self> {
         if buf.len() < 4 {
             return Err(crate::error::KvError::Corruption(
@@ -84,25 +92,28 @@ impl Block {
         let num_entries = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let mut entries = Vec::with_capacity(num_entries);
         let mut offset = 4;
+        let mut prev_key: Vec<u8> = Vec::new();
 
         for _ in 0..num_entries {
             if buf.len() < offset + 4 {
                 return Err(crate::error::KvError::Corruption(
-                    "block truncated in key_len".to_string(),
+                    "block truncated in prefix header".to_string(),
                 ));
             }
-            let key_len =
-                u32::from_le_bytes([buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]])
-                    as usize;
+            let shared = u16::from_le_bytes([buf[offset], buf[offset + 1]]) as usize;
+            let suffix_len = u16::from_le_bytes([buf[offset + 2], buf[offset + 3]]) as usize;
             offset += 4;
 
-            if buf.len() < offset + key_len {
+            if buf.len() < offset + suffix_len {
                 return Err(crate::error::KvError::Corruption(
-                    "block truncated in key".to_string(),
+                    "block truncated in key suffix".to_string(),
                 ));
             }
-            let key = buf[offset..offset + key_len].to_vec();
-            offset += key_len;
+            // Reconstruct full key: prev_key[..shared] + suffix
+            let mut key = Vec::with_capacity(shared + suffix_len);
+            key.extend_from_slice(&prev_key[..shared]);
+            key.extend_from_slice(&buf[offset..offset + suffix_len]);
+            offset += suffix_len;
 
             if buf.len() < offset + 4 {
                 return Err(crate::error::KvError::Corruption(
@@ -122,13 +133,18 @@ impl Block {
             let value = buf[offset..offset + value_len].to_vec();
             offset += value_len;
 
+            prev_key = key.clone();
             entries.push((key, value));
         }
 
         let mut block = Block::new();
         block.entries = entries;
-        block.encoded_size = offset - 4; // exclude the num_entries header
+        block.encoded_size = offset - 4;
         Ok(block)
+    }
+
+    fn prefix_shared_len(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
     }
 }
 
