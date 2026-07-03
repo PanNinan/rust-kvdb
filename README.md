@@ -8,6 +8,58 @@ A local key-value storage engine written in Rust, based on the **LSM-Tree** arch
 
 ---
 
+## Getting Started
+
+### Prerequisites
+
+- **Rust** >= 1.70 (edition 2021)
+- **OS** — Linux / macOS / Windows
+
+### Build from Source
+
+```bash
+# Clone
+git clone https://github.com/PanNinan/rust-kvdb.git
+cd rust-kvdb
+
+# Build (debug)
+cargo build
+
+# Build (release, optimized)
+cargo build --release
+
+# Run tests
+cargo test --lib
+
+# Run linter
+cargo clippy -- -D warnings
+```
+
+### Build Targets
+
+| Target | Command | Description |
+|---|---|---|
+| Library | `cargo build --lib` | Core KV engine library |
+| `kv-cli` | `cargo build --bin kv-cli` | Command-line tool |
+| `kv-server` | `cargo build --bin kv-server` | HTTP management server |
+| Benchmarks | `cargo bench` | Performance benchmarks |
+
+### Run
+
+```bash
+# Start the HTTP server (default: ./data, port 8080)
+cargo run --bin kv-server
+
+# Or specify custom path and address
+cargo run --bin kv-server -- ./mydb 0.0.0.0:3000
+
+# Use the CLI
+cargo run --bin kv-cli -- ./mydb put hello world
+cargo run --bin kv-cli -- ./mydb get hello
+```
+
+---
+
 ## Features
 
 | Category | Feature |
