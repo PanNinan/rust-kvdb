@@ -1,0 +1,17 @@
+[package]
+name = "kv-engine"
+version = "0.1.0"
+edition = "2021"
+description = "A local key-value storage engine based on LSM-Tree"
+
+[dependencies]
+# Phase 1
+crc32fast = "1"          # WAL CRC checksum
+tempfile = "3"           # Temp directory for tests (dev-dependency)
+
+[dev-dependencies]
+tempfile = "3"
+proptest = "1"
+
+[features]
+default = []
