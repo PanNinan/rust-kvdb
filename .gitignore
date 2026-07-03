@@ -4,6 +4,9 @@
 # Cargo
 Cargo.lock
 
+# Database data
+/data/
+
 # IDE
 .idea/
 .vscode/

@@ -4,6 +4,7 @@ pub mod compaction;
 pub mod engine;
 pub mod error;
 pub mod filter;
+pub mod http;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;
