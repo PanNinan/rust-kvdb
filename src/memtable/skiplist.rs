@@ -183,6 +183,12 @@ impl SkipList {
         ScanIterator { current, end }
     }
 
+    /// Return an iterator over all key-value pairs in sorted order.
+    pub fn iter(&self) -> FullIterator {
+        let start = unsafe { Node::next_at(self.head, 0) };
+        FullIterator { current: start }
+    }
+
     /// Estimated memory usage of this skip list in bytes.
     pub fn size(&self) -> usize {
         self.size
@@ -264,6 +270,31 @@ impl<'a> Iterator for ScanIterator<'a> {
                 return None;
             }
 
+            let result = (node.key.clone(), node.value.clone());
+            self.current = Node::next_at(self.current, 0);
+            Some(result)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FullIterator — yields all entries without an upper bound
+// ---------------------------------------------------------------------------
+
+/// An unbounded iterator over all entries in a skip list.
+pub struct FullIterator {
+    current: *const Node,
+}
+
+impl Iterator for FullIterator {
+    type Item = (Vec<u8>, Vec<u8>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            if self.current.is_null() {
+                return None;
+            }
+            let node = &*self.current;
             let result = (node.key.clone(), node.value.clone());
             self.current = Node::next_at(self.current, 0);
             Some(result)

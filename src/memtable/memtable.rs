@@ -50,6 +50,14 @@ impl MemTable {
         }
     }
 
+    /// Insert into the active list without triggering a freeze.
+    ///
+    /// This is used during WAL replay at startup so that the MemTable
+    /// doesn't try to flush mid-recovery.
+    pub fn put_no_freeze(&mut self, key: &[u8], value: &[u8]) {
+        self.active.insert(key, value);
+    }
+
     /// Look up a key.  The active list is searched first (most recent writes),
     /// then the immutable list.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
