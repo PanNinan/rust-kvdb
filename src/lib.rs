@@ -14,7 +14,7 @@ pub mod write_batch;
 
 pub mod test_utils;
 
-pub use engine::Engine;
+pub use engine::{DB, Engine, Metrics, MetricsSnapshot, Options, RepairReport, Snapshot};
 pub use error::KvError;
 pub use types::{Key, SequenceNumber, Value};
 pub use write_batch::{BatchOp, WriteBatch};

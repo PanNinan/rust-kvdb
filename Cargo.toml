@@ -8,6 +8,10 @@ description = "A local key-value storage engine based on LSM-Tree"
 name = "kv-cli"
 path = "src/bin/cli.rs"
 
+[[bench]]
+name = "engine_bench"
+harness = false
+
 [dependencies]
 # Phase 1
 crc32fast = "1"          # WAL CRC checksum

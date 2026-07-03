@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Result;
 use crate::manifest::{Manifest, SSTMeta};
@@ -15,11 +16,65 @@ use crate::write_batch::{BatchOp, WriteBatch};
 /// Tombstone marker written when a key is deleted.
 const TOMBSTONE: &[u8] = &[0x00];
 
-/// Default MemTable freeze threshold: 4 MiB.
-const DEFAULT_MEMTABLE_SIZE: usize = 4 * 1024 * 1024;
+/// Engine configuration options.
+#[derive(Debug, Clone)]
+pub struct Options {
+    /// MemTable freeze threshold in bytes. Default: 4 MiB.
+    pub memtable_size: usize,
+    /// SSTable data block size in bytes. Default: 4 KiB.
+    pub block_size: usize,
+    /// L0 SSTable count that triggers compaction. Default: 4.
+    pub l0_compaction_threshold: usize,
+    /// Whether to fsync after every write. Default: true.
+    pub sync_wal: bool,
+}
 
-/// Default SSTable data block size: 4 KiB.
-const DEFAULT_BLOCK_SIZE: usize = 4096;
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            memtable_size: 4 * 1024 * 1024,
+            block_size: 4096,
+            l0_compaction_threshold: 4,
+            sync_wal: true,
+        }
+    }
+}
+
+/// Atomic counters for engine metrics.
+#[derive(Debug, Default)]
+pub struct Metrics {
+    pub writes: AtomicU64,
+    pub reads: AtomicU64,
+    pub deletes: AtomicU64,
+    pub compactions: AtomicU64,
+    pub flushes: AtomicU64,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            writes: self.writes.load(Ordering::Relaxed),
+            reads: self.reads.load(Ordering::Relaxed),
+            deletes: self.deletes.load(Ordering::Relaxed),
+            compactions: self.compactions.load(Ordering::Relaxed),
+            flushes: self.flushes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A point-in-time copy of metrics.
+#[derive(Debug, Clone, Default)]
+pub struct MetricsSnapshot {
+    pub writes: u64,
+    pub reads: u64,
+    pub deletes: u64,
+    pub compactions: u64,
+    pub flushes: u64,
+}
 
 /// The top-level key-value storage engine.
 pub struct Engine {
@@ -31,6 +86,10 @@ pub struct Engine {
     next_sst_id: u64,
     /// Monotonically increasing sequence number for MVCC.
     next_seq: u64,
+    /// Engine configuration.
+    opts: Options,
+    /// Metrics counters.
+    pub metrics: Metrics,
 }
 
 /// A point-in-time snapshot of the database.
@@ -48,8 +107,13 @@ pub struct RepairReport {
 }
 
 impl Engine {
-    /// Open (or create) a database at the given directory.
+    /// Open (or create) a database at the given directory with default options.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_options(path, Options::default())
+    }
+
+    /// Open (or create) a database with custom options.
+    pub fn open_with_options(path: &Path, opts: Options) -> Result<Self> {
         fs::create_dir_all(path)?;
 
         let manifest_path = path.join("MANIFEST");
@@ -76,7 +140,7 @@ impl Engine {
         let wal_path = Self::wal_path_for_dir(path)?;
 
         // Replay WAL into a fresh MemTable (no freeze during replay).
-        let memtable = Self::replay_wal(&wal_path)?;
+        let memtable = Self::replay_wal(&wal_path, opts.memtable_size)?;
 
         // Open WAL for new writes.
         let wal = WALWriter::open(&wal_path)?;
@@ -89,14 +153,19 @@ impl Engine {
             sst_readers,
             next_sst_id,
             next_seq: 1,
+            opts,
+            metrics: Metrics::new(),
         })
     }
 
     /// Write a key-value pair.
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         self.wal.append(key, value)?;
-        self.wal.flush()?;
+        if self.opts.sync_wal {
+            self.wal.flush()?;
+        }
         self.memtable.put(key, value);
+        self.metrics.writes.fetch_add(1, Ordering::Relaxed);
         self.maybe_flush()?;
         Ok(())
     }
@@ -110,8 +179,11 @@ impl Engine {
             value: Vec::new(),
         };
         self.wal.append_record(&record)?;
-        self.wal.flush()?;
+        if self.opts.sync_wal {
+            self.wal.flush()?;
+        }
         self.memtable.put(key, TOMBSTONE);
+        self.metrics.deletes.fetch_add(1, Ordering::Relaxed);
         self.maybe_flush()?;
         Ok(())
     }
@@ -283,6 +355,8 @@ impl Engine {
     /// Search: MemTable (active → immutable) → SSTables (newest → oldest).
     /// A tombstone is treated as "not found".
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.metrics.reads.fetch_add(1, Ordering::Relaxed);
+
         // MemTable.
         if let Some(v) = self.memtable.get(key) {
             return Ok(Self::unpack_value(&v));
@@ -344,10 +418,10 @@ impl Engine {
     // -----------------------------------------------------------------------
 
     /// Replay a WAL file into a fresh MemTable.
-    fn replay_wal(wal_path: &Path) -> Result<MemTable> {
+    fn replay_wal(wal_path: &Path, memtable_size: usize) -> Result<MemTable> {
         use crate::wal::record::OpType;
 
-        let mut memtable = MemTable::with_max_size(DEFAULT_MEMTABLE_SIZE);
+        let mut memtable = MemTable::with_max_size(memtable_size);
         if wal_path.exists() {
             let reader = WALReader::open(wal_path)?;
             for entry in reader {
@@ -381,7 +455,7 @@ impl Engine {
             return Ok(());
         }
 
-        let mut builder = SSTableBuilder::new(&sst_path, DEFAULT_BLOCK_SIZE)?;
+        let mut builder = SSTableBuilder::new(&sst_path, self.opts.block_size)?;
         for (k, v) in &entries {
             builder.add(k, v)?;
         }
@@ -399,6 +473,7 @@ impl Engine {
         self.reset_wal()?;
 
         // Trigger compaction if L0 is too large.
+        self.metrics.flushes.fetch_add(1, Ordering::Relaxed);
         self.maybe_compact()?;
 
         Ok(())
@@ -406,11 +481,9 @@ impl Engine {
 
     /// Trigger L0 → L1 compaction when L0 has ≥ 4 SSTables.
     fn maybe_compact(&mut self) -> Result<()> {
-        /// Number of L0 SSTables that triggers compaction.
-        const L0_COMPACTION_THRESHOLD: usize = 4;
-
+        // Number of L0 SSTables that triggers compaction.
         let l0_count = self.manifest.ssts_at_level(0).len();
-        if l0_count < L0_COMPACTION_THRESHOLD {
+        if l0_count < self.opts.l0_compaction_threshold {
             return Ok(());
         }
 
@@ -462,7 +535,7 @@ impl Engine {
         if all_entries.is_empty() {
             // All entries were tombstones — just remove old SSTs.
         } else {
-            let mut builder = SSTableBuilder::new(&new_sst_path, DEFAULT_BLOCK_SIZE)?;
+            let mut builder = SSTableBuilder::new(&new_sst_path, self.opts.block_size)?;
             for (k, v) in &all_entries {
                 builder.add(k, v)?;
             }
@@ -488,6 +561,7 @@ impl Engine {
         }
 
         self.manifest.save(&self.path.join("MANIFEST"))?;
+        self.metrics.compactions.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -813,5 +887,178 @@ mod tests {
             }
         }
         assert!(readable > 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB — Thread-safe wrapper around Engine
+// ---------------------------------------------------------------------------
+
+use std::sync::{Arc, Mutex};
+
+/// A thread-safe handle to the key-value database.
+///
+/// All methods acquire an internal lock, making them safe to call from
+/// multiple threads concurrently.
+#[derive(Clone)]
+pub struct DB {
+    inner: Arc<Mutex<Engine>>,
+}
+
+impl DB {
+    /// Open (or create) a database with default options.
+    pub fn open(path: &Path) -> Result<Self> {
+        let engine = Engine::open(path)?;
+        Ok(DB {
+            inner: Arc::new(Mutex::new(engine)),
+        })
+    }
+
+    /// Open (or create) a database with custom options.
+    pub fn open_with_options(path: &Path, opts: Options) -> Result<Self> {
+        let engine = Engine::open_with_options(path, opts)?;
+        Ok(DB {
+            inner: Arc::new(Mutex::new(engine)),
+        })
+    }
+
+    /// Write a key-value pair.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.inner.lock().unwrap().put(key, value)
+    }
+
+    /// Delete a key.
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.inner.lock().unwrap().delete(key)
+    }
+
+    /// Look up a key.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.lock().unwrap().get(key)
+    }
+
+    /// Scan keys in `[start, end)`.
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.lock().unwrap().scan(start, end)
+    }
+
+    /// Scan keys with a given prefix.
+    pub fn prefix_scan(&self, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.lock().unwrap().prefix_scan(prefix)
+    }
+
+    /// Execute a batch of operations atomically.
+    pub fn write_batch(&self, batch: &WriteBatch) -> Result<()> {
+        self.inner.lock().unwrap().write_batch(batch)
+    }
+
+    /// Create a point-in-time snapshot.
+    pub fn snapshot(&self) -> Snapshot {
+        self.inner.lock().unwrap().snapshot()
+    }
+
+    /// Look up a key at a specific snapshot.
+    pub fn get_at(&self, key: &[u8], snap: &Snapshot) -> Result<Option<Vec<u8>>> {
+        self.inner.lock().unwrap().get_at(key, snap)
+    }
+
+    /// Write a key-value pair with a TTL.
+    pub fn put_with_ttl(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        ttl: std::time::Duration,
+    ) -> Result<()> {
+        self.inner.lock().unwrap().put_with_ttl(key, value, ttl)
+    }
+
+    /// Get a snapshot of the current metrics.
+    pub fn metrics(&self) -> MetricsSnapshot {
+        self.inner.lock().unwrap().metrics.snapshot()
+    }
+
+    /// Flush all in-memory data to disk and close the engine.
+    pub fn close(self) -> Result<()> {
+        // Unwrap the Arc — if we're the last holder, we can consume it.
+        let engine = Arc::try_unwrap(self.inner)
+            .map_err(|_| crate::error::KvError::Internal(
+                "cannot close: other references exist".to_string(),
+            ))?
+            .into_inner()
+            .unwrap();
+        engine.close()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DB Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+    use tempfile::tempdir;
+
+    #[test]
+    fn concurrent_writes_and_reads() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path()).unwrap();
+
+        let writer_db = db.clone();
+        let writer = thread::spawn(move || {
+            for i in 0..1000 {
+                let key = format!("k{:05}", i);
+                let val = format!("v{}", i);
+                writer_db.put(key.as_bytes(), val.as_bytes()).unwrap();
+            }
+        });
+
+        let reader_db = db.clone();
+        let reader = thread::spawn(move || {
+            for i in 0..1000 {
+                let key = format!("k{:05}", i);
+                let _ = reader_db.get(key.as_bytes());
+            }
+        });
+
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        // After writes complete, all keys should be readable.
+        for i in 0..1000 {
+            let key = format!("k{:05}", i);
+            assert!(db.get(key.as_bytes()).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn db_open_with_options() {
+        let dir = tempdir().unwrap();
+        let opts = Options {
+            memtable_size: 1024, // small for testing
+            block_size: 64,
+            ..Default::default()
+        };
+        let db = DB::open_with_options(dir.path(), opts).unwrap();
+        db.put(b"key", b"val").unwrap();
+        assert_eq!(db.get(b"key").unwrap(), Some(b"val".to_vec()));
+    }
+
+    #[test]
+    fn db_metrics_tracking() {
+        let dir = tempdir().unwrap();
+        let db = DB::open(dir.path()).unwrap();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.get(b"a").unwrap();
+        db.delete(b"b").unwrap();
+
+        let m = db.metrics();
+        assert_eq!(m.writes, 2);
+        assert_eq!(m.reads, 1);
+        assert_eq!(m.deletes, 1);
     }
 }
