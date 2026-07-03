@@ -109,6 +109,37 @@ impl Engine {
         Ok(None)
     }
 
+    /// Scan key-value pairs in the range `[start, end)`.
+    ///
+    /// Results are sorted by key.  Tombstones are excluded.
+    pub fn scan(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        use std::collections::BTreeMap;
+
+        let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        // SSTables (oldest first, so newer ones overwrite).
+        for (_meta, reader) in self.sst_readers.iter() {
+            for (k, v) in reader.iter() {
+                if k.as_slice() >= start && k.as_slice() < end {
+                    map.insert(k, v);
+                }
+            }
+        }
+
+        // MemTable (active + immutable, overwrites SSTables).
+        for (k, v) in self.memtable.scan(start, end) {
+            map.insert(k, v);
+        }
+
+        // Filter out tombstones.
+        let result: Vec<_> = map
+            .into_iter()
+            .filter(|(_, v)| v.as_slice() != TOMBSTONE)
+            .collect();
+
+        Ok(result)
+    }
+
     /// Flush all in-memory data to disk and close the engine.
     pub fn close(mut self) -> Result<()> {
         self.maybe_flush()?;
@@ -283,5 +314,37 @@ mod tests {
         let sub = dir.path().join("new_db");
         let db = Engine::open(&sub).unwrap();
         assert_eq!(db.get(b"anything").unwrap(), None);
+    }
+
+    #[test]
+    fn scan_returns_sorted_range() {
+        let dir = tempdir().unwrap();
+        let mut db = Engine::open(dir.path()).unwrap();
+
+        for i in 0..100 {
+            let key = format!("k{:03}", i);
+            db.put(key.as_bytes(), b"v").unwrap();
+        }
+
+        let results = db.scan(b"k010", b"k020").unwrap();
+        assert_eq!(results.len(), 10);
+        for (i, (key, _)) in results.iter().enumerate() {
+            assert_eq!(key, format!("k{:03}", i + 10).as_bytes());
+        }
+    }
+
+    #[test]
+    fn scan_excludes_tombstones() {
+        let dir = tempdir().unwrap();
+        let mut db = Engine::open(dir.path()).unwrap();
+
+        db.put(b"a", b"1").unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.put(b"c", b"3").unwrap();
+        db.delete(b"b").unwrap();
+
+        let results = db.scan(b"a", b"d").unwrap();
+        let keys: Vec<_> = results.iter().map(|(k, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![b"a".as_slice(), b"c".as_slice()]);
     }
 }
