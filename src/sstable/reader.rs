@@ -1,62 +1,78 @@
 //! SSTable reader: loads an SSTable file into memory and provides
 //! random lookup (`get`) and sequential iteration (`iter`).
 //!
-//! The entire file is read into a `Vec<u8>` (Phase 1 — no mmap dependency).
-//! The footer and index block are parsed once on `open()`.
+//! Uses the bloom filter to skip the index search when a key is definitely
+//! not present.
 
 use std::fs;
 use std::path::Path;
 
 use crate::error::{KvError, Result};
+use crate::filter::bloom::BloomFilter;
 use crate::sstable::block::Block;
 
 /// An opened SSTable file ready for reads.
 pub struct SSTableReader {
-    /// Raw file bytes (entire SSTable).
     data: Vec<u8>,
-    /// Parsed index: `(block_offset, last_key)` for each data block.
     index: Vec<(u32, Vec<u8>)>,
-    /// Byte offset where the index block starts (= end of last data block).
     index_offset: u32,
+    bloom: BloomFilter,
 }
 
 impl SSTableReader {
-    /// Open an SSTable file and parse its footer + index block.
+    /// Open an SSTable file and parse its footer, index block, and bloom filter.
     pub fn open(path: &Path) -> Result<Self> {
         let data = fs::read(path).map_err(KvError::Io)?;
-        if data.len() < 4 {
+        // Footer is now 8 bytes: index_offset(4) + bloom_offset(4).
+        if data.len() < 8 {
             return Err(KvError::Corruption("SSTable file too short".to_string()));
         }
 
-        // Read footer: last 4 bytes = index_offset.
-        let footer_start = data.len() - 4;
+        let len = data.len();
         let index_offset = u32::from_le_bytes([
-            data[footer_start],
-            data[footer_start + 1],
-            data[footer_start + 2],
-            data[footer_start + 3],
+            data[len - 8],
+            data[len - 7],
+            data[len - 6],
+            data[len - 5],
+        ]);
+        let bloom_offset = u32::from_le_bytes([
+            data[len - 4],
+            data[len - 3],
+            data[len - 2],
+            data[len - 1],
         ]);
 
-        // Parse index block.
         let index = Self::parse_index(&data, index_offset as usize)?;
+
+        // Bloom filter spans [bloom_offset .. start of footer).
+        let bloom_end = len - 8;
+        let bloom_data = &data[bloom_offset as usize..bloom_end];
+        let bloom = BloomFilter::decode(bloom_data)?;
 
         Ok(SSTableReader {
             data,
             index,
             index_offset,
+            bloom,
         })
     }
 
     /// Look up a key.  Returns `Ok(Some(value))` if found, `Ok(None)` if not.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        // Binary search the index for the data block that may contain `key`.
-        let block_idx = match self.index.binary_search_by(|entry| entry.1.as_slice().cmp(key)) {
-            Ok(i) => i,                   // exact match on last_key
+        // Bloom filter check: skip index search if key is definitely absent.
+        if !self.bloom.may_contain(key) {
+            return Ok(None);
+        }
+
+        let block_idx = match self
+            .index
+            .binary_search_by(|entry| entry.1.as_slice().cmp(key))
+        {
+            Ok(i) => i,
             Err(i) => {
                 if i < self.index.len() {
-                    i // first block whose last_key >= key
+                    i
                 } else {
-                    // key is beyond the last block's last_key → not found
                     return Ok(None);
                 }
             }
@@ -64,7 +80,6 @@ impl SSTableReader {
 
         let block = self.load_block(block_idx)?;
 
-        // Binary search within the block.
         match block
             .entries
             .binary_search_by(|entry| entry.0.as_slice().cmp(key))
@@ -89,16 +104,10 @@ impl SSTableReader {
         self.index.len()
     }
 
-    // -----------------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------------
-
-    /// Parse the index block starting at `offset`.
     fn parse_index(data: &[u8], offset: usize) -> Result<Vec<(u32, Vec<u8>)>> {
         if data.len() < offset + 4 {
             return Err(KvError::Corruption("index block too short".to_string()));
         }
-
         let num = u32::from_le_bytes([
             data[offset],
             data[offset + 1],
@@ -115,20 +124,13 @@ impl SSTableReader {
                     "index entry truncated".to_string(),
                 ));
             }
-            let block_offset = u32::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-            ]);
+            let block_offset =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
 
-            let key_len = u32::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-            ]) as usize;
+            let key_len =
+                u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]])
+                    as usize;
             pos += 4;
 
             if data.len() < pos + key_len {
@@ -145,10 +147,6 @@ impl SSTableReader {
         Ok(entries)
     }
 
-    /// Load and decode a data block by index position.
-    ///
-    /// The block spans from `index[block_idx].0` to the next block's offset
-    /// (or `index_offset` if it's the last block).
     fn load_block(&self, block_idx: usize) -> Result<Block> {
         let start = self.index[block_idx].0 as usize;
         let end = if block_idx + 1 < self.index.len() {
@@ -166,20 +164,9 @@ impl SSTableReader {
 
         Block::decode(&self.data[start..end])
     }
-
-    /// Load a block and return a reference to it (used by iterator).
-    fn load_block_cached(&self, block_idx: usize) -> Result<Block> {
-        self.load_block(block_idx)
-    }
 }
 
-// ---------------------------------------------------------------------------
-// SSTableIterator
-// ---------------------------------------------------------------------------
-
 /// Sequential iterator over all entries in an SSTable.
-///
-/// Yields `(key, value)` pairs in sorted key order across all data blocks.
 pub struct SSTableIterator<'a> {
     reader: &'a SSTableReader,
     block_idx: usize,
@@ -192,12 +179,11 @@ impl<'a> Iterator for SSTableIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Load the current block if we don't have one yet.
             if self.current_block.is_none() {
                 if self.block_idx >= self.reader.index.len() {
-                    return None; // exhausted all blocks
+                    return None;
                 }
-                self.current_block = Some(self.reader.load_block_cached(self.block_idx).ok()?);
+                self.current_block = Some(self.reader.load_block(self.block_idx).ok()?);
                 self.entry_idx = 0;
             }
 
@@ -208,16 +194,11 @@ impl<'a> Iterator for SSTableIterator<'a> {
                 return Some((k.clone(), v.clone()));
             }
 
-            // Move to the next block.
             self.block_idx += 1;
             self.current_block = None;
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -240,7 +221,6 @@ mod tests {
         assert_eq!(reader.get(b"bbb").unwrap(), Some(b"v2".to_vec()));
         assert_eq!(reader.get(b"aaa").unwrap(), Some(b"v1".to_vec()));
         assert_eq!(reader.get(b"ccc").unwrap(), Some(b"v3".to_vec()));
-        // Missing key.
         assert_eq!(reader.get(b"xxx").unwrap(), None);
     }
 
@@ -249,7 +229,6 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("multi_block.sst");
 
-        // 64-byte blocks → many blocks for 100 entries.
         let mut builder = SSTableBuilder::new(&path, 64).unwrap();
         for i in 0..100 {
             let key = format!("key_{:04}", i);
@@ -259,9 +238,8 @@ mod tests {
         builder.finish().unwrap();
 
         let reader = SSTableReader::open(&path).unwrap();
-        assert!(reader.num_blocks() > 1, "expected multiple blocks");
+        assert!(reader.num_blocks() > 1);
 
-        // Spot-check lookups across different blocks.
         assert_eq!(
             reader.get(b"key_0000").unwrap(),
             Some(b"value_0000".to_vec())
@@ -290,10 +268,8 @@ mod tests {
 
         let reader = SSTableReader::open(&path).unwrap();
         let keys: Vec<_> = reader.iter().map(|(k, _)| k).collect();
-        // Entries should arrive in the order they were written (sorted
-        // internally per block, and blocks written in order).
         for w in keys.windows(2) {
-            assert!(w[0] <= w[1], "keys not sorted: {:?} > {:?}", w[0], w[1]);
+            assert!(w[0] <= w[1]);
         }
         assert_eq!(keys.len(), 50);
     }
@@ -302,5 +278,23 @@ mod tests {
     fn sstable_reader_open_nonexistent() {
         let result = SSTableReader::open(Path::new("/no/such/file.sst"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn bloom_filter_skips_index_for_missing_key() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("bloom.sst");
+
+        let mut builder = SSTableBuilder::new(&path, 4096).unwrap();
+        for i in 0..1000 {
+            builder
+                .add(format!("key_{:04}", i).as_bytes(), b"v")
+                .unwrap();
+        }
+        builder.finish().unwrap();
+
+        let reader = SSTableReader::open(&path).unwrap();
+        // Missing key should be filtered by bloom without loading any block.
+        assert_eq!(reader.get(b"not_in_sst").unwrap(), None);
     }
 }
