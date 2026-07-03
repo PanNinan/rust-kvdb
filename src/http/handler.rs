@@ -33,9 +33,9 @@ pub fn routes(db: DB) -> Router {
         .route("/api/health", get(health))
         .route("/api/metrics", get(metrics))
         .route("/api/stats", get(stats))
-        .route("/api/get/{key}", get(get_key))
+        .route("/api/get/:key", get(get_key))
         .route("/api/put", post(put_key))
-        .route("/api/delete/{key}", post(delete_key))
+        .route("/api/delete/:key", post(delete_key))
         .route("/api/compact", post(compact))
         .with_state(Arc::new(state))
 }
