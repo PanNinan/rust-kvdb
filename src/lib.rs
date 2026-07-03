@@ -10,9 +10,11 @@ pub mod sstable;
 pub mod types;
 pub mod version;
 pub mod wal;
+pub mod write_batch;
 
 pub mod test_utils;
 
 pub use engine::Engine;
 pub use error::KvError;
 pub use types::{Key, SequenceNumber, Value};
+pub use write_batch::{BatchOp, WriteBatch};

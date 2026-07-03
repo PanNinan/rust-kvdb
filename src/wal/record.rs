@@ -3,17 +3,38 @@
 //! On-disk format (all integers little-endian):
 //!
 //! ```text
-//! [len: u32] [crc32: u32] [key_len: u32] [key: [u8]] [value_len: u32] [value: [u8]]
+//! [len: u32] [crc32: u32] [op_type: u8] [key_len: u32] [key] [value_len: u32] [value]
 //! ```
 //!
-//! - `len`  = number of bytes **after** itself: 4 (crc) + 4 (key_len) + key + 4 (value_len) + value
-//! - `crc32` = CRC32 of key_len ‖ key ‖ value_len ‖ value
+//! - `len` = bytes after itself: 4 (crc) + 1 (op) + 4 (key_len) + key + 4 (value_len) + value
+//! - `crc32` = CRC32 of op_type ‖ key_len ‖ key ‖ value_len ‖ value
 
 use crate::error::{KvError, Result};
+
+/// Operation type stored in each WAL record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OpType {
+    /// Write a key-value pair.
+    Put = 0x01,
+    /// Delete a key (tombstone).
+    Delete = 0x02,
+}
+
+impl OpType {
+    pub fn from_u8(v: u8) -> Result<Self> {
+        match v {
+            0x01 => Ok(OpType::Put),
+            0x02 => Ok(OpType::Delete),
+            _ => Err(KvError::Corruption(format!("unknown op type: {}", v))),
+        }
+    }
+}
 
 /// A single key-value record stored in the WAL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
+    pub op: OpType,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
 }
@@ -24,9 +45,8 @@ impl Record {
         let crc_payload = self.crc_payload();
         let crc = crc32fast::hash(&crc_payload);
 
-        // Layout: [len: 4] [crc: 4] [crc_payload: len(crc_payload)]
-        let record_len = 4 + crc_payload.len(); // everything after the len field
-        let total_len = 4 + record_len; // include the len field itself
+        let record_len = 4 + crc_payload.len();
+        let total_len = 4 + record_len;
 
         let mut buf = Vec::with_capacity(total_len);
         buf.extend_from_slice(&(record_len as u32).to_le_bytes());
@@ -36,19 +56,15 @@ impl Record {
     }
 
     /// Decode a record from the byte buffer that follows the `len` prefix.
-    ///
-    /// The caller reads the 4-byte `len` prefix, then passes exactly `len`
-    /// bytes to this function (i.e. `crc ‖ key_len ‖ key ‖ value_len ‖ value`).
     pub fn decode(buf: &[u8]) -> Result<Self> {
-        // Minimum: crc(4) + key_len(4) + value_len(4) = 12
-        if buf.len() < 12 {
+        // Minimum: crc(4) + op(1) + key_len(4) + value_len(4) = 13
+        if buf.len() < 13 {
             return Err(KvError::Corruption(format!(
-                "WAL record too short: need at least 12 bytes, got {}",
+                "WAL record too short: need at least 13 bytes, got {}",
                 buf.len()
             )));
         }
 
-        // CRC covers everything after itself: key_len ‖ key ‖ value_len ‖ value
         let stored_crc = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
         let actual_crc = crc32fast::hash(&buf[4..]);
 
@@ -59,9 +75,13 @@ impl Record {
             });
         }
 
-        // key_len at buf[4..8]
-        let key_len = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]) as usize;
-        let key_start = 8;
+        // op_type at buf[4]
+        let op = OpType::from_u8(buf[4])?;
+
+        // key_len at buf[5..9]
+        let key_len =
+            u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]) as usize;
+        let key_start = 9;
         let key_end = key_start + key_len;
         if buf.len() < key_end + 4 {
             return Err(KvError::Corruption("WAL record truncated in key".to_string()));
@@ -84,13 +104,13 @@ impl Record {
         }
         let value = buf[val_start..val_end].to_vec();
 
-        Ok(Record { key, value })
+        Ok(Record { op, key, value })
     }
 
-    /// Return the bytes that the CRC checksum covers:
-    /// `key_len ‖ key ‖ value_len ‖ value`.
+    /// Return the bytes that the CRC checksum covers.
     pub fn crc_payload(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(8 + self.key.len() + self.value.len());
+        let mut payload = Vec::with_capacity(9 + self.key.len() + self.value.len());
+        payload.push(self.op as u8);
         payload.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
         payload.extend_from_slice(&self.key);
         payload.extend_from_slice(&(self.value.len() as u32).to_le_bytes());
@@ -106,6 +126,7 @@ mod tests {
     #[test]
     fn record_roundtrip() {
         let rec = Record {
+            op: OpType::Put,
             key: b"hello".to_vec(),
             value: b"world".to_vec(),
         };
@@ -115,24 +136,26 @@ mod tests {
     }
 
     #[test]
-    fn record_empty_key_and_value() {
+    fn record_delete_roundtrip() {
         let rec = Record {
-            key: Vec::new(),
+            op: OpType::Delete,
+            key: b"rm".to_vec(),
             value: Vec::new(),
         };
         let encoded = rec.encode();
         let decoded = Record::decode(&encoded[4..]).unwrap();
-        assert_eq!(decoded, rec);
+        assert_eq!(decoded.op, OpType::Delete);
+        assert_eq!(decoded.key, b"rm");
     }
 
     #[test]
     fn record_crc_detects_corruption() {
         let rec = Record {
+            op: OpType::Put,
             key: b"key".to_vec(),
             value: b"val".to_vec(),
         };
         let mut encoded = rec.encode();
-        // Flip a byte in the payload area (after the len + crc prefix).
         encoded[10] ^= 0xff;
         let result = Record::decode(&encoded[4..]);
         assert!(matches!(result, Err(KvError::ChecksumMismatch { .. })));

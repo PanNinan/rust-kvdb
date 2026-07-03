@@ -9,7 +9,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use crate::error::{KvError, Result};
-use crate::wal::record::Record;
+use crate::wal::record::{OpType, Record};
 
 // ---------------------------------------------------------------------------
 // WALWriter
@@ -35,14 +35,19 @@ impl WALWriter {
     }
 
     /// Append a key-value record to the WAL and flush the internal buffer.
-    ///
-    /// After writing, `sync_data()` is called to ensure the bytes hit stable
-    /// storage (the fsync can be made configurable later).
     pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
         let record = Record {
+            op: OpType::Put,
             key: key.to_vec(),
             value: value.to_vec(),
         };
+        let encoded = record.encode();
+        self.file.write_all(&encoded)?;
+        Ok(())
+    }
+
+    /// Append a record with an explicit operation type.
+    pub fn append_record(&mut self, record: &Record) -> Result<()> {
         let encoded = record.encode();
         self.file.write_all(&encoded)?;
         Ok(())
@@ -80,34 +85,25 @@ impl WALReader {
 }
 
 impl Iterator for WALReader {
-    type Item = Result<(Vec<u8>, Vec<u8>)>;
+    type Item = Result<Record>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Read the 4-byte `len` prefix.
         let mut len_buf = [0u8; 4];
         match self.reader.read_exact(&mut len_buf) {
             Ok(()) => {}
-            // Normal EOF — no more records.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
             Err(e) => return Some(Err(KvError::Io(e))),
         }
 
         let record_len = u32::from_le_bytes(len_buf) as usize;
-
-        // Read exactly `record_len` bytes (crc + payload).
         let mut record_buf = vec![0u8; record_len];
         match self.reader.read_exact(&mut record_buf) {
             Ok(()) => {}
-            // Truncated record body — write was interrupted (crash recovery).
-            // Silently stop; the incomplete record is dropped.
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
             Err(e) => return Some(Err(KvError::Io(e))),
         }
 
-        match Record::decode(&record_buf) {
-            Ok(rec) => Some(Ok((rec.key, rec.value))),
-            Err(e) => Some(Err(e)),
-        }
+        Some(Record::decode(&record_buf))
     }
 }
 
@@ -132,10 +128,10 @@ mod tests {
 
         let entries: Vec<_> = WALReader::open(&path).unwrap().collect();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].as_ref().unwrap().0, b"key1");
-        assert_eq!(entries[0].as_ref().unwrap().1, b"value1");
-        assert_eq!(entries[1].as_ref().unwrap().0, b"key2");
-        assert_eq!(entries[1].as_ref().unwrap().1, b"value2");
+        assert_eq!(entries[0].as_ref().unwrap().key, b"key1");
+        assert_eq!(entries[0].as_ref().unwrap().value, b"value1");
+        assert_eq!(entries[1].as_ref().unwrap().key, b"key2");
+        assert_eq!(entries[1].as_ref().unwrap().value, b"value2");
     }
 
     #[test]
@@ -183,8 +179,8 @@ mod tests {
             .unwrap();
         // Should recover the first record; the second is lost.
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, b"a");
-        assert_eq!(entries[0].1, b"1");
+        assert_eq!(entries[0].key, b"a");
+        assert_eq!(entries[0].value, b"1");
     }
 
     #[test]
@@ -217,9 +213,9 @@ mod tests {
             .collect::<Result<Vec<_>>>()
             .unwrap();
         assert_eq!(entries.len(), 100);
-        for (i, (key, value)) in entries.iter().enumerate() {
-            assert_eq!(key, format!("key_{:04}", i).as_bytes());
-            assert_eq!(value, format!("val_{:04}", i).as_bytes());
+        for (i, rec) in entries.iter().enumerate() {
+            assert_eq!(rec.key, format!("key_{:04}", i).as_bytes());
+            assert_eq!(rec.value, format!("val_{:04}", i).as_bytes());
         }
     }
 }
